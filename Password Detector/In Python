@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+password_detector.py
+
+Simple Password Detector / Strength Estimator.
+
+Features:
+- Length, character-class checks (lower, upper, digits, symbols)
+- Estimate of entropy (bits) using charset size
+- Basic pattern checks: repeated characters, sequential keyboard-like sequences, year-detection
+- Check against a small built-in common-password blacklist
+- CLI usage and optional Tkinter GUI (--gui)
+"""
+
+from __future__ import annotations
+import math
+import re
+import argparse
+import sys
+import time
+
+# Optional GUI import (only required for --gui)
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    GUI_AVAILABLE = True
+except Exception:
+    GUI_AVAILABLE = False
+
+# Small built-in common password set (not exhaustive) — feel free to expand
+COMMON_PASSWORDS = {
+    "password", "123456", "123456789", "qwerty", "abc123",
+    "111111", "12345678", "password1", "12345", "iloveyou",
+    "admin", "welcome", "monkey", "letmein", "dragon",
+    "baseball", "football", "shadow", "master", "666666",
+    "qwertyuiop", "123123", "sunshine", "princess", "azerty"
+}
+
+KEYBOARD_SEQS = [
+    "qwertyuiop", "asdfghjkl", "zxcvbnm",
+    "1234567890", "0987654321", "poiuytrewq", "lkjhgfdsa"
+]
+
+def analyze_password(pw: str) -> dict:
+    """Analyze password and return a dict with metrics and feedback."""
+    if not isinstance(pw, str):
+        raise TypeError("Password must be a string")
+
+    result = {}
+    length = len(pw)
+    result['length'] = length
+
+    # Character classes
+    has_lower = bool(re.search(r'[a-z]', pw))
+    has_upper = bool(re.search(r'[A-Z]', pw))
+    has_digit = bool(re.search(r'\d', pw))
+    # Symbols: printable punctuation and others (non-alnum)
+    has_symbol = bool(re.search(r'[^A-Za-z0-9]', pw))
+
+    result.update({
+        'has_lower': has_lower,
+        'has_upper': has_upper,
+        'has_digit': has_digit,
+        'has_symbol': has_symbol
+    })
+
+    # Estimate charset size used for naive entropy estimate
+    charset_size = 0
+    if has_lower:
+        charset_size += 26
+    if has_upper:
+        charset_size += 26
+    if has_digit:
+        charset_size += 10
+    if has_symbol:
+        # approximate symbol count among printable characters
+        charset_size += 32
+
+    # Avoid zero division: if charset_size==0 treat as 1 (shouldn't happen for non-empty pw)
+    if charset_size == 0:
+        charset_size = 1
+
+    # Entropy estimate (bits) = length * log2(charset_size)
+    entropy_bits = length * math.log2(charset_size)
+    result['entropy_bits'] = entropy_bits
+
+    # Rough brute-force time estimates (assuming attacker tries N guesses/sec)
+    guesses = charset_size ** length
+    # Cap guesses to avoid huge floats
+    try:
+        guesses = float(guesses)
+    except OverflowError:
+        guesses = float('inf')
+    # Common attack speeds
+    speeds = {
+        'online_throttled': 10,        # 10 guesses/sec (online, throttled)
+        'offline_single_gpu': 1e9,     # 1 billion guesses/sec (powerful offline)
+        'very_fast_cluster': 1e12      # 1 trillion guesses/sec
+    }
+    time_estimates = {}
+    for name, speed in speeds.items():
+        if guesses == float('inf'):
+            time_estimates[name] = float('inf')
+        else:
+            secs = guesses / speed
+            time_estimates[name] = secs
+    result['time_estimates_seconds'] = time_estimates
+
+    # Basic checks / heuristics
+    feedback = []
+
+    # Common password
+    if pw.lower() in COMMON_PASSWORDS:
+        feedback.append("Password is a commonly used password — don't use it.")
+
+    # Too short
+    if length < 8:
+        feedback.append("Too short: use at least 12 characters for good security.")
+    elif length < 12:
+        feedback.append("Consider using 12+ characters for stronger protection.")
+
+    # Missing character classes
+    missing_classes = []
+    if not has_lower:
+        missing_classes.append("lowercase letters")
+    if not has_upper:
+        missing_classes.append("uppercase letters")
+    if not has_digit:
+        missing_classes.append("digits")
+    if not has_symbol:
+        missing_classes.append("symbols (e.g. !@#$)")
+
+    if missing_classes:
+        feedback.append("Include " + ", ".join(missing_classes) + " to increase complexity.")
+
+    # Repeated characters or sequences
+    if re.search(r'(.)\1\1', pw):
+        feedback.append("Avoid long runs of the same character (e.g. 'aaa' or '111').")
+
+    # Check for years (e.g., 1984, 2020)
+    if re.search(r'(19|20)\d{2}', pw):
+        feedback.append("Avoid embedding years or easily guessable numbers (birth years).")
+
+    # Keyboard sequences
+    lowered = pw.lower()
+    for seq in KEYBOARD_SEQS:
+        if seq in lowered or lowered in seq:
+            feedback.append("Avoid simple keyboard sequences like 'qwerty' or 'asdf'.")
+
+    # Mixed-case but common patterns (like 'Password1!')
+    if length <= 12 and pw[0].isalpha() and pw[1:].isdigit():
+        feedback.append("Pattern looks predictable (letters then digits). Consider a passphrase.")
+
+    # Entropy-based advice
+    if entropy_bits < 40:
+        feedback.append(f"Low estimated entropy ({entropy_bits:.1f} bits). Very weak.")
+    elif entropy_bits < 60:
+        feedback.append(f"Moderate estimated entropy ({entropy_bits:.1f} bits). Consider increasing length or character variety.")
+    else:
+        feedback.append(f"Good estimated entropy ({entropy_bits:.1f} bits).")
+
+    # Compose overall score 0..100 (naive)
+    score = 0
+    # base on entropy
+    score += min(50, (entropy_bits / 60) * 50)  # up to 50 points from entropy (60 bits -> full)
+    # classes
+    class_count = sum([has_lower, has_upper, has_digit, has_symbol])
+    score += (class_count - 1) * 15  # 0..45 points (having at least 2 classes helps)
+    # bonus for length > 16
+    if length >= 16:
+        score += 10
+
+    # clamp
+    score = max(0, min(100, score))
+    result['score'] = score
+    result['feedback'] = list(dict.fromkeys(feedback))  # unique in order
+
+    # Friendly rating
+    if score < 30:
+        rating = "Very weak"
+    elif score < 50:
+        rating = "Weak"
+    elif score < 70:
+        rating = "Moderate"
+    elif score < 90:
+        rating = "Strong"
+    else:
+        rating = "Excellent"
+    result['rating'] = rating
+
+    return result
+
+def pretty_seconds(seconds: float) -> str:
+    """Convert seconds to human-friendly string."""
+    if seconds == float('inf'):
+        return "∞"
+    secs = int(seconds)
+    if secs < 60:
+        return f"{secs} seconds"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins} minutes"
+    hours = mins // 60
+    if hours < 24:
+        return f"{hours} hours"
+    days = hours // 24
+    if days < 365:
+        return f"{days} days"
+    years = days // 365
+    if years < 1000:
+        return f"{years} years"
+    return f">{years} years"
+
+def print_report(pw: str, analysis: dict):
+    print("="*60)
+    print(f"Password: {'*' * len(pw)}  (length {analysis['length']})")
+    print(f"Rating: {analysis['rating']}  (score {analysis['score']:.0f}/100)")
+    print(f"Estimated entropy: {analysis['entropy_bits']:.1f} bits")
+    print("\nCharacter classes present:")
+    print(f"  Lowercase: {analysis['has_lower']}")
+    print(f"  Uppercase: {analysis['has_upper']}")
+    print(f"  Digits:    {analysis['has_digit']}")
+    print(f"  Symbols:   {analysis['has_symbol']}")
+    print("\nEstimated time to brute-force (examples):")
+    te = analysis['time_estimates_seconds']
+    print(f"  Online (10 guesses/sec): {pretty_seconds(te['online_throttled'])}")
+    print(f"  Offline single GPU (~1e9/sec): {pretty_seconds(te['offline_single_gpu'])}")
+    print(f"  Very fast cluster (~1e12/sec): {pretty_seconds(te['very_fast_cluster'])}")
+    print("\nFeedback / Suggestions:")
+    for note in analysis['feedback']:
+        print(f" - {note}")
+    print("="*60)
+
+# ---------------------------
+# CLI
+# ---------------------------
+def cli_main():
+    parser = argparse.ArgumentParser(description="Password Detector / Strength Estimator")
+    parser.add_argument('password', nargs='?', help="Password to analyze. If omitted, you'll be prompted.")
+    parser.add_argument('--gui', action='store_true', help="Open a simple GUI (requires tkinter).")
+    args = parser.parse_args()
+
+    if args.gui:
+        if not GUI_AVAILABLE:
+            print("Tkinter GUI not available on this system.")
+            sys.exit(1)
+        run_gui()
+        return
+
+    if args.password is None:
+        try:
+            import getpass
+            pw = getpass.getpass("Enter password to analyze: ")
+        except Exception:
+            pw = input("Enter password to analyze: ")
+    else:
+        pw = args.password
+
+    analysis = analyze_password(pw)
+    print_report(pw, analysis)
+
+# ---------------------------
+# Simple Tkinter GUI
+# ---------------------------
+def run_gui():
+    if not GUI_AVAILABLE:
+        raise RuntimeError("GUI not available (tkinter import failed).")
+
+    root = tk.Tk()
+    root.title("Password Detector")
+
+    root.geometry("600x420")
+    root.resizable(False, False)
+
+    frm = ttk.Frame(root, padding=12)
+    frm.pack(fill='both', expand=True)
+
+    ttk.Label(frm, text="Enter password:").grid(row=0, column=0, sticky='w')
+    pw_var = tk.StringVar()
+    pw_entry = ttk.Entry(frm, textvariable=pw_var, show="*", width=40)
+    pw_entry.grid(row=0, column=1, padx=6, pady=6)
+
+    result_text = tk.Text(frm, height=18, width=72, wrap='word')
+    result_text.grid(row=2, column=0, columnspan=3, pady=8)
+
+    def analyze_and_show():
+        pw = pw_var.get()
+        if not pw:
+            messagebox.showinfo("Input needed", "Please enter a password to analyze.")
+            return
+        analysis = analyze_password(pw)
+        # Build report
+        lines = []
+        lines.append(f"Rating: {analysis['rating']}  (score {analysis['score']:.0f}/100)")
+        lines.append(f"Length: {analysis['length']}    Entropy: {analysis['entropy_bits']:.1f} bits\n")
+        lines.append("Character classes present:")
+        lines.append(f"  Lowercase: {analysis['has_lower']}")
+        lines.append(f"  Uppercase: {analysis['has_upper']}")
+        lines.append(f"  Digits:    {analysis['has_digit']}")
+        lines.append(f"  Symbols:   {analysis['has_symbol']}\n")
+        lines.append("Estimated time to brute-force (examples):")
+        te = analysis['time_estimates_seconds']
+        lines.append(f"  Online (10 guesses/sec): {pretty_seconds(te['online_throttled'])}")
+        lines.append(f"  Offline single GPU (~1e9/sec): {pretty_seconds(te['offline_single_gpu'])}")
+        lines.append(f"  Very fast cluster (~1e12/sec): {pretty_seconds(te['very_fast_cluster'])}\n")
+        lines.append("Feedback / Suggestions:")
+        for note in analysis['feedback']:
+            lines.append(f" - {note}")
+
+        result_text.delete(1.0, tk.END)
+        result_text.insert(tk.END, "\n".join(lines))
+
+    analyze_btn = ttk.Button(frm, text="Analyze", command=analyze_and_show)
+    analyze_btn.grid(row=1, column=1, sticky='w')
+
+    def toggle_show():
+        if pw_entry.cget('show') == '':
+            pw_entry.config(show='*')
+            toggle_btn.config(text='Show')
+        else:
+            pw_entry.config(show='')
+            toggle_btn.config(text='Hide')
+
+    toggle_btn = ttk.Button(frm, text="Show", command=toggle_show)
+    toggle_btn.grid(row=1, column=2, sticky='w')
+
+    pw_entry.focus()
+    root.mainloop()
+
+# ---------------------------
+# If used as module, expose functions
+# ---------------------------
+if __name__ == '__main__':
+    cli_main()
